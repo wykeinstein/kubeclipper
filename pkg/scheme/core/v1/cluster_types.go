@@ -250,18 +250,19 @@ type Networking struct {
 }
 
 var (
-	AllowedCNI = sets.NewString("calico")
+	AllowedCNI = sets.NewString("calico", "cilium")
 )
 
 type CNI struct {
 	LocalRegistry string `json:"localRegistry" optional:"true"`
 	// TODO: Cluster multiple cni plugins are not supported at this time
-	Type      string  `json:"type" enum:"calico"`
+	Type      string  `json:"type" enum:"calico|cilium"`
 	Version   string  `json:"version"`
 	CriType   string  `json:"criType"`
 	Offline   bool    `json:"offline"`
 	Namespace string  `json:"namespace"`
 	Calico    *Calico `json:"calico" optional:"true"`
+	Cilium    *Cilium `json:"cilium" optional:"true"`
 }
 
 type Calico struct {
@@ -270,6 +271,13 @@ type Calico struct {
 	Mode              string `json:"mode" enum:"BGP|Overlay-IPIP-All|Overlay-IPIP-Cross-Subnet|Overlay-Vxlan-All|Overlay-Vxlan-Cross-Subnet|overlay"`
 	IPManger          bool   `json:"IPManger" optional:"true"`
 	MTU               int    `json:"mtu"`
+}
+
+type Cilium struct {
+	ClusterPoolIPv4PodCIDRList []string `json:"clusterPoolIPv4PodCIDRList"`
+	ClusterPoolIPv4MaskSize    int      `json:"clusterPoolIPv4MaskSize"`
+	KubeProxyReplacement       string   `json:"kubeProxyReplacement"`
+	OperatorReplicas           int      `json:"operatorReplicas"`
 }
 
 type Etcd struct {
