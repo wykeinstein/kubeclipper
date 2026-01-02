@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import argparse
+import gzip
+import hashlib
 import json
 import os
 import re
@@ -25,8 +27,24 @@ def run(cmd: List[str], capture: bool = False) -> str:
     return ""
 
 
-def tar_dir(src_dir: str, dst_tar: str) -> None:
-    with tarfile.open(dst_tar, "w:gz") as tar:
+def md5sum(path: str) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def safe_filename(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._+-]+", "_", s)
+
+
+def tar_dir_as_tgz(src_dir: str, dst_tgz: str) -> None:
+    """
+    把目录打成 .tgz（tar.gz），归档内包含目录名本身（basename）。
+    输出文件名按 KubeClipper 资源习惯：charts.tgz
+    """
+    with tarfile.open(dst_tgz, "w:gz") as tar:
         tar.add(src_dir, arcname=os.path.basename(src_dir))
 
 
@@ -58,6 +76,7 @@ def collect_images_from_obj(obj: Any, out: List[str], seen: Set[str]) -> None:
         return
 
     if isinstance(obj, dict):
+        # 1) 标准 Pod spec container image
         for k in ("containers", "initContainers", "ephemeralContainers"):
             v = obj.get(k)
             if isinstance(v, list):
@@ -68,6 +87,7 @@ def collect_images_from_obj(obj: Any, out: List[str], seen: Set[str]) -> None:
                             out.append(img)
                             seen.add(img)
 
+        # 2) chart values 常见 image: {repository, tag} 结构
         if "image" in obj:
             v = obj.get("image")
             if isinstance(v, str):
@@ -101,6 +121,7 @@ def render_images(chart_path: str, values_path: Optional[str], helm_args: List[s
             collect_images_from_obj(doc, images, seen)
         return images
 
+    # fallback regex
     print("[WARN] PyYAML not installed, fallback to regex parsing. Recommend: pip install pyyaml")
     images, seen = [], set()
     for line in text.splitlines():
@@ -123,6 +144,7 @@ def image_exists(tool: str, image: str, ctr_namespace: str) -> bool:
             return True
         if tool == "ctr":
             out = run(["ctr", "-n", ctr_namespace, "images", "ls", "-q"], capture=True)
+            # ctr ls 输出可能包含 digest / 展示形式不同，做 contains
             return any(image == line.strip() or image in line.strip() for line in out.splitlines())
     except subprocess.CalledProcessError:
         return False
@@ -173,28 +195,23 @@ def pull_images(images: List[str], tool: str, parallel: int, ctr_namespace: str,
             print(f"  - {img}: {msg}")
 
 
-def save_images(images: List[str], tool: str, outfile: str, ctr_namespace: str) -> None:
+def save_images_to_tar(images: List[str], tool: str, outfile_tar: str, ctr_namespace: str) -> None:
     if not images:
         return
     if tool == "nerdctl":
-        cmd = ["nerdctl", "save", "-o", outfile] + images
+        cmd = ["nerdctl", "save", "-o", outfile_tar] + images
     elif tool == "docker":
-        cmd = ["docker", "save", "-o", outfile] + images
+        cmd = ["docker", "save", "-o", outfile_tar] + images
     elif tool == "ctr":
-        cmd = ["ctr", "-n", ctr_namespace, "images", "export", outfile] + images
+        cmd = ["ctr", "-n", ctr_namespace, "images", "export", outfile_tar] + images
     else:
         raise RuntimeError(f"unsupported image tool: {tool}")
     run(cmd)
 
 
-def make_metadata(name: str, addon_type: str, version: str, arch: str) -> Dict[str, Any]:
-    return {"addons": [{"type": addon_type, "name": name, "version": version, "arch": arch}],
-            "kc_versions": []}
-
-
-def safe_filename(s: str) -> str:
-    # 避免出现路径分隔符或奇怪字符导致文件名不合法
-    return re.sub(r"[^A-Za-z0-9._+-]+", "_", s)
+def gzip_file(src: str, dst_gz: str) -> None:
+    with open(src, "rb") as f_in, gzip.open(dst_gz, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
 
 
 def resolve_values_path(chart_path: str, values_arg: Optional[str]) -> Optional[str]:
@@ -204,16 +221,48 @@ def resolve_values_path(chart_path: str, values_arg: Optional[str]) -> Optional[
     return default_values if os.path.isfile(default_values) else None
 
 
+def write_manifest(arch_dir: str, version: str, arch: str, filenames: List[str]) -> None:
+    """
+    在 <...>/<version>/<arch>/manifest.json 写入：
+    [
+      {"name": "...", "digest": "<md5>", "path": "vX.Y.Z/amd64"},
+      ...
+    ]
+    """
+    rel_path = f"{version}/{arch}"
+    arr = []
+    for fn in filenames:
+        fp = os.path.join(arch_dir, fn)
+        if not os.path.isfile(fp):
+            continue
+        arr.append({
+            "name": fn,
+            "digest": md5sum(fp),
+            "path": rel_path,
+        })
+    manifest_path = os.path.join(arch_dir, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(arr, f, indent=2, ensure_ascii=False)
+
+
+def create_final_tarball(output: str, top_dir: str) -> None:
+    """
+    关键点：tar 内顶层必须是 <name>/...，不能是 '.'，否则 kcctl after-hook 会 rm -rf '.'
+    这里用 arcname=basename(top_dir) 来保证顶层目录正确。
+    """
+    base = os.path.basename(top_dir.rstrip("/"))
+    with tarfile.open(output, "w:gz") as out:
+        out.add(top_dir, arcname=base)
+
+
 def main():
-    p = argparse.ArgumentParser(description="Package kubeclipper addon resource with images")
+    p = argparse.ArgumentParser(description="Package kubeclipper addon resource with images (manifest.json style)")
     p.add_argument("--chart-path", required=True, help="Unpacked Helm chart root")
-    # ✅ values 变可选：不传就默认用 chart 里的 values.yaml（如果存在）
     p.add_argument("--values", help="values.yaml path (optional, default: <chart>/values.yaml if exists)")
-    p.add_argument("--name", required=True, help="addon name, e.g. cilium")
-    p.add_argument("--type", default="cni", help="addon type (cni/csi/cri/app)")
-    p.add_argument("--version", required=True, help="addon version, e.g. v1.14.5")
+    p.add_argument("--name", required=True, help="addon name, e.g. calico/cilium")
+    p.add_argument("--type", default="cni", help="addon type (cni/csi/cri/app) [currently not used in manifest mode]")
+    p.add_argument("--version", required=True, help="addon version, e.g. v3.26.1")
     p.add_argument("--arch", default="amd64", help="arch, e.g. amd64/arm64")
-    # ✅ output 可选：不传就按 name-version-arch.tar.gz
     p.add_argument("--output", help="output tar.gz (default: <name>-<version>-<arch>.tar.gz)")
 
     p.add_argument("--image-tool", default="nerdctl", choices=["nerdctl", "docker", "ctr"],
@@ -231,50 +280,66 @@ def main():
 
     args = p.parse_args()
 
-    # ✅ 默认 output：name-version-arch.tar.gz
     if not args.output:
-        out_name = f"{safe_filename(args.name)}-{safe_filename(args.version)}-{safe_filename(args.arch)}.tar.gz"
-        args.output = out_name
+        args.output = f"{safe_filename(args.name)}-{safe_filename(args.version)}-{safe_filename(args.arch)}.tar.gz"
 
-    # ✅ 默认 values：<chart>/values.yaml（存在才用）
     values_path = resolve_values_path(args.chart_path, args.values)
 
     workdir = tempfile.mkdtemp(prefix="kc-addon-")
     try:
-        target_dir = os.path.join(workdir, args.name, args.version, args.arch)
-        os.makedirs(target_dir, exist_ok=True)
+        # 最终包的顶层目录必须是 <name>/...
+        top_dir = os.path.join(workdir, args.name)
+        arch_dir = os.path.join(top_dir, args.version, args.arch)
+        os.makedirs(arch_dir, exist_ok=True)
 
-        chart_tar = os.path.join(target_dir, "chart.tgz")
-        tar_dir(args.chart_path, chart_tar)
+        # 1) 打 charts.tgz
+        charts_tgz = os.path.join(arch_dir, "charts.tgz")
+        tar_dir_as_tgz(args.chart_path, charts_tgz)
 
-        # 打包时把 values 拷贝进去（如果存在）
-        if values_path:
-            shutil.copy(values_path, os.path.join(target_dir, "values.yaml"))
-
+        # 2) 渲染镜像列表
         images = render_images(args.chart_path, values_path, args.helm_arg)
 
-        images_list = os.path.join(target_dir, "images.list")
-        with open(images_list, "w") as f:
+        # 3) 写 images.list（可选，但很有用）
+        images_list_path = os.path.join(arch_dir, "images.list")
+        with open(images_list_path, "w", encoding="utf-8") as f:
             f.write("\n".join(images))
 
+        # 4) 先 pull 再 save
         if images and args.pull:
             pull_images(images, args.image_tool, args.parallel, args.ctr_namespace, args.ignore_pull_errors)
 
+        # 5) 保存 images.tar.gz（注意：manifest 示例是 tar.gz）
+        images_targz = os.path.join(arch_dir, "images.tar.gz")
         if images:
-            images_tar = os.path.join(target_dir, "images.tar")
-            save_images(images, args.image_tool, images_tar, args.ctr_namespace)
+            tmp_tar = os.path.join(arch_dir, "images.tar")
+            save_images_to_tar(images, args.image_tool, tmp_tar, args.ctr_namespace)
+            gzip_file(tmp_tar, images_targz)
+            os.remove(tmp_tar)
+        else:
+            # 没镜像也可以不生成 images.tar.gz（按需）
+            pass
 
-        meta = make_metadata(args.name, args.type, args.version, args.arch)
-        with open(os.path.join(workdir, "metadata.json"), "w") as f:
-            json.dump(meta, f, indent=2)
+        # 6) 生成 manifest.json（在 arch_dir 下）
+        #    按你的 calico 示例：只列 charts.tgz 和 images.tar.gz
+        manifest_files = ["charts.tgz"]
+        if os.path.isfile(images_targz):
+            manifest_files.append("images.tar.gz")
+        write_manifest(arch_dir, args.version, args.arch, manifest_files)
 
-        with tarfile.open(args.output, "w:gz") as out:
-            out.add(workdir, arcname=".")
+        # 7) 打最终资源包（顶层是 <name>/，绝对不能是 '.'）
+        create_final_tarball(args.output, top_dir)
+
         print("resource package generated:", args.output)
-        print("values used:", values_path if values_path else "(none)")
+        print("values used for rendering:", values_path if values_path else "(none)")
         print("images (%d):" % len(images))
         for img in images:
             print("  ", img)
+
+        print("\npackage layout (top-level):")
+        print(f"  {args.name}/{args.version}/{args.arch}/charts.tgz")
+        if os.path.isfile(images_targz):
+            print(f"  {args.name}/{args.version}/{args.arch}/images.tar.gz")
+        print(f"  {args.name}/{args.version}/{args.arch}/manifest.json")
 
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
