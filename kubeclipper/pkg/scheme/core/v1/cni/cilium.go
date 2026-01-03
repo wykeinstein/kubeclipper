@@ -186,6 +186,7 @@ func InstallCiliumRelease(chartPath string, values string, namespace string, nod
 const ciliumValuesTemplate = `operator:
   replicas: {{ if .CiliumConfig }}{{.CiliumConfig.OperatorReplicas}}{{else}}1{{end}}
 ipam:
+  mode: "{{ if .CiliumConfig }}{{ if .CiliumConfig.IPAMMode }}{{.CiliumConfig.IPAMMode}}{{else}}cluster-pool{{end}}{{else}}cluster-pool{{end}}"
   operator:
     clusterPoolIPv4PodCIDRList: {{ if .CiliumConfig }}{{ toJson .CiliumConfig.ClusterPoolIPv4PodCIDRList }}{{else}}["192.168.64.0/18"]{{end}}
     clusterPoolIPv4MaskSize: {{ if .CiliumConfig }}{{.CiliumConfig.ClusterPoolIPv4MaskSize}}{{else}}25{{end}}

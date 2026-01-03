@@ -274,6 +274,7 @@ type Calico struct {
 }
 
 type Cilium struct {
+	IPAMMode                   string   `json:"ipamMode"`
 	ClusterPoolIPv4PodCIDRList []string `json:"clusterPoolIPv4PodCIDRList"`
 	ClusterPoolIPv4MaskSize    int      `json:"clusterPoolIPv4MaskSize"`
 	KubeProxyReplacement       string   `json:"kubeProxyReplacement"`
